@@ -7,7 +7,7 @@ BEGIN
 EXEC dbo.sp_executesql @statement = N'CREATE PROCEDURE [dbo].[IndexOptimize] AS'
 END
 GO
-ALTER PROCEDURE [dbo].[IndexOptimize]
+CREATE OR ALTER PROCEDURE [dbo].[#IndexOptimize]
 
 @Databases nvarchar(max) = NULL,
 @FragmentationLow nvarchar(max) = NULL,
@@ -40,6 +40,7 @@ ALTER PROCEDURE [dbo].[IndexOptimize]
 @LockMessageSeverity int = 16,
 @StringDelimiter nvarchar(max) = ',',
 @DatabaseOrder nvarchar(max) = NULL,
+@SetPriorty nvarchar(max) = NULL,
 @DatabasesInParallel nvarchar(max) = 'N',
 @ExecuteAsUser nvarchar(max) = NULL,
 @LogToTable nvarchar(max) = 'N',
@@ -341,11 +342,10 @@ BEGIN
   RAISERROR('%s',10,1,@StartMessage) WITH NOWAIT
 
   RAISERROR(@EmptyLine,10,1) WITH NOWAIT
-
-  ----------------------------------------------------------------------------------------------------
+--#region Check core requirements
+   ----------------------------------------------------------------------------------------------------
   --// Check core requirements                                                                    //--
   ----------------------------------------------------------------------------------------------------
-
   IF NOT (SELECT [compatibility_level] FROM sys.databases WHERE database_id = DB_ID()) >= 90
   BEGIN
     INSERT INTO @Errors ([Message], Severity, [State])
@@ -399,7 +399,8 @@ BEGIN
     INSERT INTO @Errors ([Message], Severity, [State])
     SELECT 'The transaction count is not 0.', 16, 1
   END
-
+--#endregion
+--#region Select databases
   ----------------------------------------------------------------------------------------------------
   --// Select databases                                                                           //--
   ----------------------------------------------------------------------------------------------------
@@ -526,7 +527,8 @@ BEGIN
     INSERT INTO @Errors ([Message], Severity, [State])
     SELECT 'The value for the parameter @Databases is not supported.', 16, 1
   END
-
+--#endregion
+--#region Select availability groups
   ----------------------------------------------------------------------------------------------------
   --// Select availability groups                                                                 //--
   ----------------------------------------------------------------------------------------------------
@@ -633,7 +635,8 @@ BEGIN
     INSERT INTO @Errors ([Message], Severity, [State])
     SELECT 'You can only specify one of the parameters @Databases and @AvailabilityGroups.', 16, 3
   END
-
+--#endregion
+--#region SELECT indexes
   ----------------------------------------------------------------------------------------------------
   --// Select indexes                                                                             //--
   ----------------------------------------------------------------------------------------------------
@@ -687,7 +690,8 @@ BEGIN
   SELECT DatabaseName, SchemaName, ObjectName, IndexName, StartPosition, Selected
   FROM Indexes4
   OPTION (MAXRECURSION 0)
-
+--#endregion
+--#region Select actions
   ----------------------------------------------------------------------------------------------------
   --// Select actions                                                                             //--
   ----------------------------------------------------------------------------------------------------
@@ -757,7 +761,8 @@ BEGIN
          [Action]
   FROM FragmentationHigh
   OPTION (MAXRECURSION 0)
-
+--#endregion
+--#region Check input parameters
   ----------------------------------------------------------------------------------------------------
   --// Check input parameters                                                                     //--
   ----------------------------------------------------------------------------------------------------
@@ -1082,6 +1087,14 @@ BEGIN
 
   ----------------------------------------------------------------------------------------------------
 
+  IF @SetPriorty NOT IN ('USAGE_READS_ASC','USAGE_READS_DESC','USAGE_WRITES_ASC','USAGE_WRITES_DESC','USAGE_READWRITES_ASC','USAGE_READWRITES_DESC','USAGE_CALULATED')
+  BEGIN
+    INSERT INTO @Errors ([Message], Severity, [State])
+    SELECT 'The value for the parameter @SetPriorty is not supported.', 16, 1
+  END
+
+  ----------------------------------------------------------------------------------------------------
+
   IF @DatabasesInParallel NOT IN('Y','N') OR @DatabasesInParallel IS NULL
   BEGIN
     INSERT INTO @Errors ([Message], Severity, [State])
@@ -1125,7 +1138,8 @@ BEGIN
     INSERT INTO @Errors ([Message], Severity, [State])
     SELECT 'The documentation is available at https://ola.hallengren.com/sql-server-index-and-statistics-maintenance.html.', 16, 1
   END
-
+--#endregion 
+--#region Check that selected databases and availability groups exist
   ----------------------------------------------------------------------------------------------------
   --// Check that selected databases and availability groups exist                                //--
   ----------------------------------------------------------------------------------------------------
@@ -1709,13 +1723,201 @@ BEGIN
         AND (tmpIndexesStatistics.StatisticsName = SelectedIndexes2.StatisticsName OR tmpIndexesStatistics.StatisticsName IS NULL)
       END;
 
-      WITH tmpIndexesStatistics AS (
-      SELECT SchemaName, ObjectName, [Order], ROW_NUMBER() OVER (ORDER BY ISNULL(ResumableIndexOperation,0) DESC, StartPosition ASC, SchemaName ASC, ObjectName ASC, CASE WHEN IndexType IS NULL THEN 1 ELSE 0 END ASC, IndexType ASC, IndexName ASC, StatisticsName ASC, PartitionNumber ASC) AS RowNumber
-      FROM @tmpIndexesStatistics tmpIndexesStatistics
-      WHERE Selected = 1
-      )
-      UPDATE tmpIndexesStatistics
-      SET [Order] = RowNumber
+
+      IF @SetPriorty IS NULL
+      BEGIN
+        WITH tmpIndexesStatistics AS (
+        SELECT SchemaName, ObjectName, [Order], ROW_NUMBER() OVER (ORDER BY ISNULL(ResumableIndexOperation,0) DESC, StartPosition ASC, SchemaName ASC, ObjectName ASC, CASE WHEN IndexType IS NULL THEN 1 ELSE 0 END ASC, IndexType ASC, IndexName ASC, StatisticsName ASC, PartitionNumber ASC) AS RowNumber
+        FROM @tmpIndexesStatistics tmpIndexesStatistics
+        WHERE Selected = 1
+        )
+        UPDATE tmpIndexesStatistics
+        SET [Order] = RowNumber
+      END
+      ELSE
+      BEGIN
+        --create variable table
+         CREATE TABLE #DbIndexStatsUsage  --TODO: i THINK WAY TO RESOLVE ERROR WOULD BE TO PUT MOST OF THE CODE INTO DYNAMIC SCRIPT.
+        (
+            -- DBName NVARCHAR(300), --This shouldn't be needed, remove if not used
+            -- DBIdentifier INT,  --This shouldn't be needed, remove if not used
+            SchemaID INT,
+            SchemaName NVARCHAR(300),
+            ObjectID INT,
+            ObjectName NVARCHAR(300),
+            ObjectType NVARCHAR(2),
+            IndexID INT,
+            IndexName NVARCHAR(300),
+            StatisticsID INT,
+            StatisticsName NVARCHAR(300),
+            [TotalReads] BIGINT,
+            [TotalWrites] BIGINT,
+            [TotalRows] BIGINT,
+            TotalColumns INT,
+            OrderBy_USAGE_READS_ASC DECIMAL(12,8),
+            OrderBy_USAGE_READS_DESC DECIMAL(12,8),
+            OrderBy_USAGE_WRITES_ASC DECIMAL(12,8),
+            OrderBy_USAGE_WRITES_DESC DECIMAL(12,8),
+            OrderBy_USAGE_READWRITES_ASC DECIMAL(12,8),
+            OrderBy_USAGE_READWRITES_DESC DECIMAL(12,8),
+            OrderBy_USAGE_CALULATED DECIMAL(12,8)
+        );
+
+        --Update with base data already captured in @tmpIndexesStatistics
+        INSERT INTO #DbIndexStatsUsage (SchemaId, SchemaName, ObjectId, ObjectName, ObjectType, IndexId, IndexName, StatisticsId, StatisticsName)
+        SELECT SchemaId, SchemaName, ObjectId, ObjectName, ObjectType, IndexId, IndexName, StatisticsId, StatisticsName
+        FROM @tmpIndexesStatistics tis
+        WHERE tis.Selected = 1
+
+        --Update with 'Index' and 'Stat' statstical data
+            -----------------------------------
+            --INDEX 
+        SET @CurrentCommand = ''
+        SET @CurrentCommand = '
+        UPDATE disu
+        SET
+            TotalReads = IndexUsageStats.TotalReads,
+            TotalWrites = IndexUsageStats.TotalWrites,
+            TotalRows = ISNULL(parts.TotalRows, 0),
+            TotalColumns =  c.NumberOfColumns
+        FROM #DbIndexStatsUsage disu
+        LEFT JOIN sys.indexes i ON disu.[ObjectID] = i.[object_id]
+                                    AND  disu.[IndexID] = i.[index_id]
+        LEFT JOIN sys.objects o ON disu.[ObjectID] = o.[object_id]
+        LEFT JOIN sys.sysusers su ON o.[schema_id] = su.[UID]
+        OUTER APPLY (SELECT 
+                          [user_seeks] + [user_scans] + [user_lookups] AS TotalReads, 
+                          [user_updates] AS TotalWrites  
+                    FROM sys.dm_db_index_usage_stats AS ddius --standard indexes
+                    WHERE ddius.[Object_ID] = i.[object_id]
+                          AND ddius.[index_id] = i.[index_id]
+                   --TODO: Azure Synapse Analytics
+        ) AS IndexUsageStats
+                    -- SELECT * FROM sys.dm_db_xtp_index_stats   --memory-optimized indexes
+        OUTER APPLY (SELECT SUM(sp.rows) AS TotalRows
+                      FROM sys.partitions SP
+                      WHERE SP.[object_id] = i.[object_id]
+                        AND SP.[index_id] = i.[index_id]
+                    ) parts
+        OUTER APPLY (SELECT COUNT(*) NumberOfColumns
+                     FROM sys.index_columns c
+                     WHERE c.[object_id] = i.[object_id]
+                          AND c.[index_id] = i.[index_id]
+                    )c'
+        EXECUTE @CurrentDatabase_sp_executesql @stmt = @CurrentCommand;
+
+        --Update 'Order' by using the priorty set by user
+        WITH dbIndexOrder_cte
+        AS (
+           SELECT  
+          CONVERT(DECIMAL(15,8), ROW_NUMBER() OVER (ORDER BY dbi.TotalReads ASC)) AS OrderBy_USAGE_READS_ASC,
+          CONVERT(DECIMAL(15,8), ROW_NUMBER() OVER (ORDER BY dbi.TotalReads DESC)) AS OrderBy_USAGE_READS_DESC,
+          CONVERT(DECIMAL(15,8), ROW_NUMBER() OVER (ORDER BY dbi.TotalWrites ASC)) AS OrderBy_USAGE_WRITES_ASC,
+          CONVERT(DECIMAL(15,8), ROW_NUMBER() OVER (ORDER BY dbi.TotalWrites DESC)) AS OrderBy_USAGE_WRITES_DESC,
+          CONVERT(DECIMAL(15,8), ROW_NUMBER() OVER (ORDER BY dbi.TotalReads ASC)) + ROW_NUMBER() OVER (ORDER BY TotalWrites ASC) AS OrderBy_USAGE_READWRITES_ASC,
+          CONVERT(DECIMAL(15,8), ROW_NUMBER() OVER (ORDER BY dbi.TotalReads DESC)) + ROW_NUMBER() OVER (ORDER BY TotalWrites DESC) AS OrderBy_USAGE_READWRITES_DESC, 
+          CONVERT(DECIMAL(15,8), ROW_NUMBER() OVER (ORDER BY(TotalWrites/dbTotalWrites)*((TotalReads/dbTotalReads) +(TotalColumns*TotalRows))+(TotalColumns*TotalRows/totalItems))) AS OrderBy_USAGE_CALULATED
+          ,SchemaId, SchemaName, ObjectId, ObjectName, ObjectType, IndexId, IndexName, StatisticsId, StatisticsName
+          FROM #DbIndexStatsUsage dbi
+          CROSS APPLY (SELECT SUM(TotalReads) AS dbTotalReads, SUM(TotalWrites) AS dbTotalWrites, count(*) AS totalItems
+                      FROM #DbIndexStatsUsage cadbi) dbsum
+          )
+        , dbStatOrder_cte AS (--This is meant to update the statictics that relate to an index by the schema and table/view. Workaround to statictics not having read, write stats
+          SELECT
+          CONVERT(DECIMAL(15,8), ( MIN_OrderBy_USAGE_READS_ASC + '.' + ROW_NUMBER() OVER (ORDER BY TotalReads ASC))) AS OrderBy_USAGE_READS_ASC,
+          CONVERT(DECIMAL(15,8), ( MIN_OrderBy_USAGE_READS_DESC + '.' + ROW_NUMBER() OVER (ORDER BY TotalReads DESC))) AS OrderBy_USAGE_READS_DESC,
+          CONVERT(DECIMAL(15,8), ( MIN_OrderBy_USAGE_WRITES_ASC + '.' + ROW_NUMBER() OVER (ORDER BY TotalWrites ASC))) AS OrderBy_USAGE_WRITES_ASC,
+          CONVERT(DECIMAL(15,8), ( MIN_OrderBy_USAGE_WRITES_DESC + '.' + ROW_NUMBER() OVER (ORDER BY TotalWrites DESC))) AS OrderBy_USAGE_WRITES_DESC,
+          CONVERT(DECIMAL(15,8), ( MIN_OrderBy_USAGE_READWRITES_ASC + '.' + (ROW_NUMBER() OVER (ORDER BY TotalReads ASC)) + ROW_NUMBER() OVER (ORDER BY TotalWrites ASC))) AS OrderBy_USAGE_READWRITES_ASC,
+          CONVERT(DECIMAL(15,8), ( MIN_OrderBy_USAGE_READWRITES_DESC + '.' + (ROW_NUMBER() OVER (ORDER BY TotalReads DESC)) + ROW_NUMBER() OVER (ORDER BY TotalWrites DESC))) AS OrderBy_USAGE_READWRITES_DESC, 
+          CONVERT(DECIMAL(15,8), ( MIN_OrderBy_USAGE_CALULATED + '.' + ROW_NUMBER() OVER (ORDER BY(TotalWrites/dbTotalWrites)*((TotalReads/dbTotalReads) +(TotalColumns*TotalRows))+(TotalColumns*TotalRows/totalItems)))) AS OrderBy_USAGE_CALULATED
+          ,SchemaId, SchemaName, ObjectId, ObjectName, ObjectType, IndexId, IndexName, StatisticsId, StatisticsName
+          FROM dbIndexOrder_cte cte
+          OUTER APPLY ( SELECT  
+                            MIN(op_cte.OrderBy_USAGE_READS_ASC) AS MIN_OrderBy_USAGE_READS_ASC,
+                            MIN(op_cte.OrderBy_USAGE_READS_DESC) AS MIN_OrderBy_USAGE_READS_DESC,
+                            MIN(op_cte.OrderBy_USAGE_WRITES_ASC) AS MIN_OrderBy_USAGE_WRITES_ASC,
+                            MIN(op_cte.OrderBy_USAGE_WRITES_DESC) AS MIN_OrderBy_USAGE_WRITES_DESC,
+                            MIN(op_cte.OrderBy_USAGE_READWRITES_ASC) AS MIN_OrderBy_USAGE_READWRITES_ASC,
+                            MIN(op_cte.OrderBy_USAGE_READWRITES_DESC) AS MIN_OrderBy_USAGE_READWRITES_DESC,
+                            MIN(op_cte.OrderBy_USAGE_CALULATED) AS MIN_OrderBy_USAGE_CALULATED
+                        FROM dbIndexOrder_cte op_cte 
+                        WHERE op_cte.OrderBy_USAGE_CALULATED IS NOT NULL
+                          AND op_cte.SchemaID = cte.SchemaID
+                          AND op_cte.ObjectID = cte.ObjectID
+                        GROUP BY op_cte.SchemaID, op_cte.ObjectID
+                        -- ORDER BY CASE @SetPriorty 
+                        --   WHEN 'USAGE_READS_ASC'
+                        --     THEN op_cte.OrderBy_USAGE_READS_ASC
+                        --   WHEN 'USAGE_READS_DESC'
+                        --     THEN op_cte.OrderBy_USAGE_READS_DESC
+                        --   WHEN 'USAGE_WRITES_ASC'
+                        --     THEN op_cte.OrderBy_USAGE_WRITES_ASC
+                        --   WHEN 'USAGE_WRITES_DESC'
+                        --     THEN op_cte.OrderBy_USAGE_WRITES_DESC
+                        --   WHEN 'USAGE_READWRITES_ASC'
+                        --     THEN op_cte.OrderBy_USAGE_READWRITES_ASC
+                        --   WHEN 'USAGE_READWRITES_DESC'
+                        --     THEN op_cte.OrderBy_USAGE_READWRITES_DESC
+                        --   WHEN 'USAGE_CALULATED'
+                        --     THEN op_cte.OrderBy_USAGE_CALULATED
+                        -- END
+                      ) AS op   
+          WHERE cte.OrderBy_USAGE_READS_ASC IS NULL
+        )
+        UPDATE dbi
+        SET
+
+          OrderBy_USAGE_READS_ASC  = orderby.OrderBy_USAGE_READS_ASC,
+          OrderBy_USAGE_READS_DESC = orderby.OrderBy_USAGE_READS_DESC,
+          OrderBy_USAGE_WRITES_ASC = orderby.OrderBy_USAGE_WRITES_ASC,
+          OrderBy_USAGE_WRITES_DESC = orderby.OrderBy_USAGE_WRITES_DESC,
+          OrderBy_USAGE_READWRITES_ASC = orderby.OrderBy_USAGE_READWRITES_ASC,
+          OrderBy_USAGE_READWRITES_DESC = orderby.OrderBy_USAGE_READWRITES_DESC,
+          OrderBy_USAGE_CALULATED = orderby.OrderBy_USAGE_CALULATED
+        FROM DbIndexStatsUsage dbi
+        JOIN (SELECT *
+              FROM dbIndexOrder_cte iocte
+              UNION
+              SELECT *
+              FROM dbStatOrder_cte socte) AS orderby ON dbi.indexId = orderby.IndexId OR dbi.StatisticsId = orderby.StatisticsId
+        -- OUTER APPLY (SELECT  
+        --                     MAX(iocte.OrderBy_USAGE_READS_ASC) AS MAX_OrderBy_USAGE_READS_ASC,
+        --                     MAX(iocte.OrderBy_USAGE_READS_DESC) AS MAX_OrderBy_USAGE_READS_DESC,
+        --                     MAX(iocte.OrderBy_USAGE_WRITES_ASC) AS MAX_OrderBy_USAGE_WRITES_ASC,
+        --                     MAX(iocte.OrderBy_USAGE_WRITES_DESC) AS MAX_OrderBy_USAGE_WRITES_DESC,
+        --                     MAX(iocte.OrderBy_USAGE_READWRITES_ASC) AS MAX_OrderBy_USAGE_READWRITES_ASC,
+        --                     MAX(iocte.OrderBy_USAGE_READWRITES_DESC) AS MAX_OrderBy_USAGE_READWRITES_DESC,
+        --                     MAX(iocte.OrderBy_USAGE_CALULATED) AS MAX_OrderBy_USAGE_CALULATED
+        --             FROM dbIndexOrder_cte iocte) iocte
+
+        UPDATE tmpIndexesStatistics
+        SET [Order] =  CASE @SetPriorty 
+                          WHEN 'USAGE_READS_ASC'
+                            THEN dbis.OrderBy_USAGE_READS_ASC
+                          WHEN 'USAGE_READS_DESC'
+                            THEN dbis.OrderBy_USAGE_READS_DESC
+                          WHEN 'USAGE_WRITES_ASC'
+                            THEN dbis.OrderBy_USAGE_WRITES_ASC
+                          WHEN 'USAGE_WRITES_DESC'
+                            THEN dbis.OrderBy_USAGE_WRITES_DESC
+                          WHEN 'USAGE_READWRITES_ASC'
+                            THEN dbis.OrderBy_USAGE_READWRITES_ASC
+                          WHEN 'USAGE_READWRITES_DESC'
+                            THEN dbis.OrderBy_USAGE_READWRITES_DESC
+                          WHEN 'USAGE_CALULATED'
+                            THEN dbis.OrderBy_USAGE_CALULATED
+                        END 
+        FROM @tmpIndexesStatistics AS tmpIndexesStatistics
+        JOIN #DbIndexStatsUsage dbis ON dbis.ObjectID = tmpIndexesStatistics.ObjectID
+                                       AND ( (tmpIndexesStatistics.IndexID IS NOT NULL AND tmpIndexesStatistics.IndexID = dbis.IndexID)
+                                            OR (tmpIndexesStatistics.StatisticsID IS NOT NULL AND tmpIndexesStatistics.StatisticsID = dbis.StatisticsID) )
+
+        /*--display data for testing */
+        select *
+        from #DbIndexStatsUsage;
+        /*--display data for testing */
+      END
 
       SET @ErrorMessage = ''
       SELECT @ErrorMessage = @ErrorMessage + QUOTENAME(DatabaseName) + '.' + QUOTENAME(SchemaName) + '.' + QUOTENAME(ObjectName) + ', '
@@ -1798,7 +2000,7 @@ BEGIN
 
           IF @LockTimeout IS NOT NULL SET @CurrentCommand = 'SET LOCK_TIMEOUT ' + CAST(@LockTimeout * 1000 AS nvarchar) + '; '
 
-          IF @CurrentIsPartition = 0 SET @CurrentCommand += 'IF EXISTS(SELECT * FROM sys.indexes indexes INNER JOIN sys.objects objects ON indexes.[object_id] = objects.[object_id] INNER JOIN sys.schemas schemas ON objects.[schema_id] = schemas.[schema_id] WHERE objects.[type] IN(''U'',''V'') AND indexes.[type] IN(1,2,3,4,5,6,7) AND indexes.is_disabled = 0 AND indexes.is_hypothetical = 0 AND schemas.[schema_id] = @ParamSchemaID AND schemas.[name] = @ParamSchemaName AND objects.[object_id] = @ParamObjectID AND objects.[name] = @ParamObjectName AND objects.[type] = @ParamObjectType AND indexes.index_id = @ParamIndexID AND indexes.[name] = @ParamIndexName AND indexes.[type] = @ParamIndexType) BEGIN SET @ParamIndexExists = 1 END'
+          IF @CurrentIsPartition = 0 SET @CurrentCommand += 'IF EXISTS(SELECT * FROM sys.indexes indexes INNER JOIN sys.objects objects ON indexes.[object_id] = objects.[object_id] INNER JOIN sys.schemas schemas ON objects.[schema_id] = schemas.[schema_id] WHERE objects.[type] IN(''U'',''V'') AND indexes.[type] IN(1,2,3,4,5,6,7) AND indexes.is_disabled = 0 AND indexes.is_hypothetical = 0 AND schemas.[schema_id] = @ParamSchemaID AND schemas.[name] = @ParamSchemaName AND objects.[object_id] = @ParamObjectID AND objects.[name] = @ParamObjectName AND objects.[type] = @ParamObjectType AND indexes.index_id = @ParaMAXdexID AND indexes.[name] = @ParamIndexName AND indexes.[type] = @ParamIndexType) BEGIN SET @ParamIndexExists = 1 END'
           IF @CurrentIsPartition = 1 SET @CurrentCommand += 'IF EXISTS(SELECT * FROM sys.indexes indexes INNER JOIN sys.objects objects ON indexes.[object_id] = objects.[object_id] INNER JOIN sys.schemas schemas ON objects.[schema_id] = schemas.[schema_id] INNER JOIN sys.partitions partitions ON indexes.[object_id] = partitions.[object_id] AND indexes.index_id = partitions.index_id WHERE objects.[type] IN(''U'',''V'') AND indexes.[type] IN(1,2,3,4,5,6,7) AND indexes.is_disabled = 0 AND indexes.is_hypothetical = 0 AND schemas.[schema_id] = @ParamSchemaID AND schemas.[name] = @ParamSchemaName AND objects.[object_id] = @ParamObjectID AND objects.[name] = @ParamObjectName AND objects.[type] = @ParamObjectType AND indexes.index_id = @ParamIndexID AND indexes.[name] = @ParamIndexName AND indexes.[type] = @ParamIndexType AND partitions.partition_id = @ParamPartitionID AND partitions.partition_number = @ParamPartitionNumber) BEGIN SET @ParamIndexExists = 1 END'
 
           BEGIN TRY
@@ -2434,3 +2636,8 @@ END
 
 GO
 
+EXEC MASTER.[dbo].[#IndexOptimize] 
+  @LogToTable = 'y', 
+  @Execute = 'n', 
+  @Databases = 'All_DATABASES'--
+  ,@SetPriorty = 'USAGE_READS_ASC'
